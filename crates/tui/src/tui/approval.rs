@@ -210,14 +210,21 @@ pub fn classify_risk(tool_name: &str, category: ToolCategory, params: &Value) ->
             "web_search" | "web_run" => RiskLevel::Benign,
             _ => RiskLevel::Destructive,
         },
-        // Shell is always destructive. We probe command_safety for
-        // shape so a future routing tweak (say, pure-readonly `ls`
-        // staying benign) lands here without a second pass.
+        // Shell risk is now derived from command_safety analysis:
+        // - Safe / WorkspaceSafe commands (ls, mkdir, git status, cargo
+        //   build, etc.) get a single-key Benign confirmation.
+        // - RequiresApproval / Dangerous / unrecognised commands keep the
+        //   two-key Destructive confirmation.
         ToolCategory::Shell => {
+            use crate::command_safety::{SafetyLevel, analyze_command};
             if let Some(cmd) = params.get("command").and_then(Value::as_str) {
-                let _ = crate::command_safety::analyze_command(cmd);
+                match analyze_command(cmd).level {
+                    SafetyLevel::Safe | SafetyLevel::WorkspaceSafe => RiskLevel::Benign,
+                    _ => RiskLevel::Destructive,
+                }
+            } else {
+                RiskLevel::Destructive
             }
-            RiskLevel::Destructive
         }
         // File writes, MCP actions, unclassified surfaces — all
         // require explicit confirmation.
