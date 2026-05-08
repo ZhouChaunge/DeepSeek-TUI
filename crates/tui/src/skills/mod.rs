@@ -2,15 +2,16 @@
 
 pub mod install;
 mod system;
+pub mod watcher;
 // Re-exports kept for documentation parity and downstream consumers; the
 // binary itself imports directly from `skills::install`. `#[allow(...)]`
 // silences the dead-code warning that fires because no `bin` source path
 // references these names through `skills::*`.
 #[allow(unused_imports)]
 pub use install::{
-    DEFAULT_MAX_SIZE_BYTES, DEFAULT_REGISTRY_URL, INSTALLED_FROM_MARKER, InstallOutcome,
-    InstallSource, InstalledSkill, RegistryDocument, RegistryEntry, RegistryFetchResult,
-    UpdateResult,
+    BulkImportResult, DEFAULT_MAX_SIZE_BYTES, DEFAULT_REGISTRY_URL, INSTALLED_FROM_MARKER,
+    InstallOutcome, InstallSource, InstalledSkill, RegistryDocument, RegistryEntry,
+    RegistryFetchResult, UpdateResult,
 };
 pub use system::install_system_skills;
 
@@ -38,6 +39,18 @@ pub fn default_skills_dir() -> PathBuf {
 
 // === Types ===
 
+/// Declares the tool-naming convention used by a skill's body text.
+/// When `ClaudeCode`, the runtime adapter translates tool references
+/// (e.g. `Bash(*)` → `shell_execute`) before injecting the skill body.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ToolCompat {
+    /// Native DeepSeek TUI tool names — no translation needed.
+    #[default]
+    Native,
+    /// Skill was authored for Claude Code; tool names need translation.
+    ClaudeCode,
+}
+
 /// Parsed representation of a SKILL.md definition.
 #[derive(Debug, Clone)]
 pub struct Skill {
@@ -49,6 +62,24 @@ pub struct Skill {
     /// or manually-placed skills, so callers must use this rather than
     /// reconstructing `<dir>/<name>/SKILL.md`.
     pub path: PathBuf,
+    /// Optional argument hint shown in the help line, e.g. `[query-or-arxiv-id]`.
+    /// Sourced from the `argument-hint:` YAML frontmatter key (ARIS convention).
+    pub argument_hint: Option<String>,
+    /// Optional allowed-tools annotation from the `allowed-tools:` frontmatter
+    /// key (ARIS convention). Advisory only — not currently enforced by the
+    /// tool registry, but surfaced in `/skill browse` and `/skill list`.
+    pub allowed_tools: Option<String>,
+    /// Tool naming convention declared by `tool-compat:` frontmatter key.
+    /// Defaults to `ToolCompat::Native` when absent.
+    pub tool_compat: ToolCompat,
+    /// Model alias hints declared by `models:` frontmatter key.
+    /// Maps role names (e.g. `"reviewer"`) to alias names (e.g. `"reviewer"`).
+    pub model_hints: HashMap<String, String>,
+    /// Keywords that can trigger auto-suggestion of this skill.
+    /// Sourced from `trigger.keywords:` frontmatter key.
+    pub trigger_keywords: Vec<String>,
+    /// Maximum number of review rounds. Sourced from `max-rounds:` frontmatter key.
+    pub max_rounds: Option<u32>,
 }
 
 /// Collection of discovered skills.
@@ -139,6 +170,70 @@ impl SkillRegistry {
 
         let description = metadata.get("description").cloned().unwrap_or_default();
 
+        // ARIS-compatible optional fields.
+        let argument_hint = metadata
+            .get("argument-hint")
+            .filter(|v| !v.is_empty())
+            .map(|v| {
+                // Strip surrounding brackets if present: `[query]` → `query`
+                v.trim_matches(|c| c == '[' || c == ']').trim().to_string()
+            })
+            .filter(|v| !v.is_empty());
+
+        let allowed_tools = metadata
+            .get("allowed-tools")
+            .filter(|v| !v.is_empty())
+            .cloned();
+
+        // tool-compat field
+        let tool_compat = match metadata.get("tool-compat").map(|s| s.as_str()) {
+            Some("claude-code") | Some("claudecode") | Some("claude_code") => ToolCompat::ClaudeCode,
+            Some(other) if !other.is_empty() => {
+                // Unknown value — warn but don't fail, fall back to Native.
+                tracing::warn!("Unknown tool-compat value '{}' in {}", other, _path.display());
+                ToolCompat::Native
+            }
+            _ => ToolCompat::Native,
+        };
+
+        // models: field — simple single-line YAML map parsing
+        // Expected format: `models: reviewer: reviewer, implementer: main`
+        // or multiline `reviewer: reviewer` on subsequent lines (best-effort).
+        let model_hints: HashMap<String, String> = metadata
+            .get("models")
+            .map(|v| {
+                // Try to parse `key: value` pairs separated by commas or newlines.
+                v.split(|c| c == ',' || c == '\n')
+                    .filter_map(|pair| {
+                        let pair = pair.trim();
+                        pair.split_once(':').map(|(k, v)| {
+                            (k.trim().to_string(), v.trim().to_string())
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // trigger.keywords field
+        let trigger_keywords: Vec<String> = metadata
+            .get("trigger.keywords")
+            .or_else(|| metadata.get("trigger"))
+            .map(|v| {
+                // Strip surrounding brackets and split by comma.
+                let cleaned = v.trim_matches(|c| c == '[' || c == ']');
+                cleaned
+                    .split(',')
+                    .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // max-rounds field
+        let max_rounds: Option<u32> = metadata
+            .get("max-rounds")
+            .and_then(|v| v.parse::<u32>().ok());
+
         let body = body.trim().to_string();
 
         Ok(Skill {
@@ -148,6 +243,12 @@ impl SkillRegistry {
             // Filled in by `discover` after parse succeeds; default to an
             // empty path so direct constructors (e.g. tests) compile.
             path: PathBuf::new(),
+            argument_hint,
+            allowed_tools,
+            tool_compat,
+            model_hints,
+            trigger_keywords,
+            max_rounds,
         })
     }
 
@@ -176,6 +277,27 @@ impl SkillRegistry {
     #[must_use]
     pub fn len(&self) -> usize {
         self.skills.len()
+    }
+
+    /// Find skills whose `trigger_keywords` match any word in `user_input`.
+    /// Returns skills sorted by number of keyword hits (descending).
+    #[must_use]
+    pub fn suggest_by_keywords(&self, user_input: &str) -> Vec<&Skill> {
+        let lower = user_input.to_ascii_lowercase();
+        let mut scored: Vec<(&Skill, usize)> = self
+            .skills
+            .iter()
+            .filter_map(|skill| {
+                let hits = skill
+                    .trigger_keywords
+                    .iter()
+                    .filter(|kw| lower.contains(kw.to_ascii_lowercase().as_str()))
+                    .count();
+                if hits > 0 { Some((skill, hits)) } else { None }
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.into_iter().map(|(s, _)| s).collect()
     }
 }
 
@@ -220,19 +342,38 @@ pub fn resolve_skills_dir(workspace: &Path) -> PathBuf {
 /// 3. `<workspace>/.opencode/skills` — OpenCode interop.
 /// 4. `<workspace>/.claude/skills` — Claude Code interop.
 /// 5. [`default_skills_dir`] — global, user-installed.
+/// 6. `extra_dirs` — user-configured additional directories (#13).
 ///
 /// Only directories that exist on disk are returned — callers don't
 /// need to filter further. Returns an empty vec when nothing is
 /// installed (the system-prompt skills block is then suppressed).
 #[must_use]
 pub fn skills_directories(workspace: &Path) -> Vec<PathBuf> {
-    let candidates = [
+    skills_directories_with_extra(workspace, &[])
+}
+
+/// Like [`skills_directories`] but also appends caller-supplied `extra_dirs`
+/// after the built-in chain. Supports `~` home-dir expansion. (#13)
+#[must_use]
+pub fn skills_directories_with_extra(workspace: &Path, extra_dirs: &[std::path::PathBuf]) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = vec![
         workspace.join(".agents").join("skills"),
         workspace.join("skills"),
         workspace.join(".opencode").join("skills"),
         workspace.join(".claude").join("skills"),
         default_skills_dir(),
     ];
+    // Append extra_dirs with `~` expansion, deduplicating as we go.
+    for raw in extra_dirs {
+        let expanded = if let Ok(stripped) = raw.strip_prefix("~") {
+            dirs::home_dir()
+                .map(|h| h.join(stripped))
+                .unwrap_or_else(|| raw.clone())
+        } else {
+            raw.clone()
+        };
+        candidates.push(expanded);
+    }
     let mut out = Vec::new();
     for path in candidates {
         if path.is_dir() && !out.iter().any(|p: &PathBuf| p == &path) {
@@ -252,8 +393,15 @@ pub fn skills_directories(workspace: &Path) -> Vec<PathBuf> {
 /// load.
 #[must_use]
 pub fn discover_in_workspace(workspace: &Path) -> SkillRegistry {
+    discover_in_workspace_with_extra(workspace, &[])
+}
+
+/// Like [`discover_in_workspace`] but also scans `extra_dirs` after the
+/// built-in chain. Name conflicts resolved with first-match-wins. (#13)
+#[must_use]
+pub fn discover_in_workspace_with_extra(workspace: &Path, extra_dirs: &[std::path::PathBuf]) -> SkillRegistry {
     let mut merged = SkillRegistry::default();
-    for dir in skills_directories(workspace) {
+    for dir in skills_directories_with_extra(workspace, extra_dirs) {
         let registry = SkillRegistry::discover(&dir);
         for skill in registry.skills {
             if !merged.skills.iter().any(|s| s.name == skill.name) {
@@ -373,6 +521,82 @@ fn truncate_for_prompt(value: &str, max_chars: usize) -> String {
         .collect::<String>();
     truncated.push('…');
     truncated
+}
+
+// === Tool Name Translation ===
+
+/// Translate Claude Code tool names in a skill body to DeepSeek TUI equivalents.
+///
+/// Only called when `skill.tool_compat == ToolCompat::ClaudeCode`.
+/// Returns the translated body string.
+#[must_use]
+pub fn translate_tool_names(body: &str) -> String {
+    // Ordered longest-match first to avoid partial substitutions.
+    const MAPPINGS: &[(&str, &str)] = &[
+        ("mcp__codex__codex-reply", "llm_call"),
+        ("mcp__codex__codex", "llm_call"),
+        // Bash(command) — keep parens content, just rename the tool
+        ("Bash(", "shell_execute("),
+        ("Read(", "read_file("),
+        ("Write(", "write_file("),
+        ("Edit(", "apply_patch("),
+        ("MultiEdit(", "apply_patch("),
+        ("Grep(", "search_files("),
+        ("Glob(", "find_files("),
+        ("Agent(", "agent_spawn("),
+        ("Skill(", "load_skill("),
+        // Plain names without parens (in prose descriptions)
+        ("`Bash`", "`shell_execute`"),
+        ("`Read`", "`read_file`"),
+        ("`Write`", "`write_file`"),
+        ("`Edit`", "`apply_patch`"),
+        ("`Grep`", "`search_files`"),
+        ("`Glob`", "`find_files`"),
+        ("`Agent`", "`agent_spawn`"),
+    ];
+
+    let mut result = body.to_string();
+    for (from, to) in MAPPINGS {
+        result = result.replace(from, to);
+    }
+    result
+}
+
+/// Build the runtime adapter block appended to a ClaudeCode-compat skill body.
+#[must_use]
+pub fn runtime_adapter_block(skill: &Skill) -> String {
+    let mut lines = vec![
+        String::new(),
+        "---".to_string(),
+        "## Runtime Adapter (DeepSeek TUI)".to_string(),
+        String::new(),
+        "Tool name mapping is active (claude-code → deepseek-tui):".to_string(),
+        "| Claude Code | DeepSeek TUI |".to_string(),
+        "|---|---|".to_string(),
+        "| `Bash(*)` | `shell_execute` |".to_string(),
+        "| `Read` | `read_file` |".to_string(),
+        "| `Write` | `write_file` |".to_string(),
+        "| `Edit` / `MultiEdit` | `apply_patch` |".to_string(),
+        "| `Grep` | `search_files` |".to_string(),
+        "| `Glob` | `find_files` |".to_string(),
+        "| `Agent` | `agent_spawn` |".to_string(),
+        "| `mcp__codex__codex` | `llm_call(alias=\"reviewer\", ...)` |".to_string(),
+    ];
+
+    if !skill.model_hints.is_empty() {
+        lines.push(String::new());
+        lines.push("Model aliases required by this skill:".to_string());
+        for (role, alias) in &skill.model_hints {
+            if alias == "main" {
+                lines.push(format!("- `{role}` → primary model (current session model)"));
+            } else {
+                lines.push(format!("- `{role}` → `llm_call(alias=\"{alias}\", ...)`"));
+            }
+        }
+    }
+
+    lines.push("---".to_string());
+    lines.join("\n")
 }
 
 // === CLI Helpers ===
