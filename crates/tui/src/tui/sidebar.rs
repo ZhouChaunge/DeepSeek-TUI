@@ -672,13 +672,47 @@ fn render_context_panel(f: &mut Frame, area: Rect, app: &App) {
 
     // ── Session cost ─────────────────────────────────────────────
     let total_cost = app.session.session_cost + app.session.subagent_cost;
+    let fmt_total = crate::pricing::format_cost_with_currency(
+        total_cost,
+        Some(&app.cost_currency),
+        Some(app.cny_per_usd),
+    );
+    let fmt_session = crate::pricing::format_cost_with_currency(
+        app.session.session_cost,
+        Some(&app.cost_currency),
+        Some(app.cny_per_usd),
+    );
+    let fmt_agents = crate::pricing::format_cost_with_currency(
+        app.session.subagent_cost,
+        Some(&app.cost_currency),
+        Some(app.cny_per_usd),
+    );
     lines.push(Line::from(Span::styled(
         format!(
-            "cost: ${total_cost:.4} (session ${:.4} + agents ${:.4})",
-            app.session.session_cost, app.session.subagent_cost
+            "cost: {fmt_total} (session {fmt_session} + agents {fmt_agents})",
         ),
         Style::default().fg(palette::TEXT_MUTED),
     )));
+
+    // ── Secondary model (llm_call) per-alias costs ────────────────────────
+    let alias_costs = crate::llm_call_costs::peek();
+    if !alias_costs.is_empty() {
+        let parts: Vec<String> = alias_costs
+            .iter()
+            .map(|(alias, entry)| {
+                let cost_str = crate::pricing::format_cost_with_currency(
+                    entry.cost_usd,
+                    Some(&app.cost_currency),
+                    Some(app.cny_per_usd),
+                );
+                format!("{alias}:{cost_str}({}calls)", entry.calls)
+            })
+            .collect();
+        lines.push(Line::from(Span::styled(
+            format!("  llm_call: {}", parts.join(" ")),
+            Style::default().fg(palette::TEXT_MUTED),
+        )));
+    }
 
     // ── MCP servers ──────────────────────────────────────────────
     if app.mcp_configured_count > 0 {
