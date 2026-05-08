@@ -669,6 +669,12 @@ pub struct App {
     /// live by `/statusline`. The renderer iterates this slice; no item is
     /// hardcoded in the footer code path.
     pub status_items: Vec<crate::config::StatusItem>,
+    /// Currency used for displaying session cost figures. Sourced from
+    /// `tui.cost_currency` in `~/.deepseek/config.toml`.
+    pub cost_currency: crate::config::CostCurrency,
+    /// USD → CNY exchange rate. Sourced from `tui.cny_per_usd`; defaults to
+    /// [`crate::pricing::DEFAULT_CNY_PER_USD`] when absent.
+    pub cny_per_usd: f64,
     /// Project documentation (AGENTS.md or CLAUDE.md)
     #[allow(dead_code)]
     pub project_doc: Option<String>,
@@ -695,6 +701,11 @@ pub struct App {
     pub tool_log: Vec<String>,
     /// Active skill to apply to next user message
     pub active_skill: Option<String>,
+    /// When `true`, a Reviewer sub-agent is spawned automatically after each
+    /// agent turn to critique the Executor output (dual-agent adversarial
+    /// review mode). Toggled by `/review-mode on|off`; initialized from
+    /// `[review].auto_review` in `~/.deepseek/config.toml`.
+    pub auto_review: bool,
     /// Tool call cells by tool id (for cells already finalized in `history`).
     /// While a tool call is in flight inside `active_cell`, it is tracked by
     /// `active_tool_entries` instead and migrated here at flush time.
@@ -835,6 +846,11 @@ pub struct App {
     /// Whether LSP diagnostics are currently enabled. Mirrors the config file
     /// `[lsp].enabled` setting. Toggled at runtime via `/lsp on|off`.
     pub lsp_enabled: bool,
+
+    /// Optional file-system watcher for skill hot-reload (#19).
+    /// `None` when the skills directory does not exist at launch or the OS
+    /// watcher could not be initialised — both are silent no-ops.
+    pub skill_watcher: Option<crate::skills::watcher::SkillWatcherHandle>,
 }
 
 /// Message queued while the engine is busy.
@@ -1052,6 +1068,7 @@ impl App {
         };
 
         let input_history = crate::composer_history::load_history();
+        let skill_watcher = crate::skills::watcher::start_watcher(skills_dir.clone());
         let (initial_input_text, initial_input_cursor) = match initial_input {
             // #451: pre-populate the composer when invoked via
             // `deepseek pr <N>` (or any future caller that wants to
@@ -1172,6 +1189,16 @@ impl App {
                 .as_ref()
                 .and_then(|tui| tui.status_items.clone())
                 .unwrap_or_else(crate::config::StatusItem::default_footer),
+            cost_currency: config
+                .tui
+                .as_ref()
+                .and_then(|tui| tui.cost_currency.clone())
+                .unwrap_or_default(),
+            cny_per_usd: config
+                .tui
+                .as_ref()
+                .and_then(|tui| tui.cny_per_usd)
+                .unwrap_or(crate::pricing::DEFAULT_CNY_PER_USD),
             project_doc: None,
             plan_state,
             plan_prompt_pending: false,
@@ -1193,6 +1220,11 @@ impl App {
             mcp_restart_required: false,
             tool_log: Vec::new(),
             active_skill: None,
+            auto_review: config
+                .review
+                .as_ref()
+                .and_then(|r| r.auto_review)
+                .unwrap_or(false),
             tool_cells: HashMap::new(),
             tool_details_by_cell: HashMap::new(),
             context_references_by_cell: HashMap::new(),
@@ -1238,6 +1270,7 @@ impl App {
             collapsed_cell_map: Vec::new(),
             edit_in_progress: false,
             lsp_enabled: config.lsp.as_ref().and_then(|l| l.enabled).unwrap_or(true),
+            skill_watcher,
         }
     }
 
@@ -2014,6 +2047,30 @@ impl App {
             self.quit_armed_until = None;
             self.needs_redraw = true;
         }
+    }
+
+    /// Poll the skill watcher and, if a `SKILL.md` changed, show a status
+    /// toast. Skills are re-discovered on each use so no explicit cache
+    /// invalidation is needed here (#19).
+    pub fn tick_skill_watcher(&mut self) {
+        // Temporarily take the watcher out of self to avoid a borrow conflict
+        // when calling push_status_toast.
+        let Some(watcher) = self.skill_watcher.take() else {
+            return;
+        };
+        if let Ok(event) = watcher.rx.try_recv() {
+            tracing::info!(
+                path = %event.trigger_path.display(),
+                "Skill hot-reload triggered"
+            );
+            let skill_count = crate::skills::SkillRegistry::discover(&watcher.skills_dir).len();
+            self.push_status_toast(
+                format!("Skills reloaded ({skill_count} loaded)"),
+                StatusToastLevel::Info,
+                Some(3000),
+            );
+        }
+        self.skill_watcher = Some(watcher);
     }
 
     pub fn set_sticky_status(
