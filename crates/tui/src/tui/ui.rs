@@ -507,6 +507,11 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         notes_path: config.notes_path(),
         mcp_config_path: config.mcp_config_path(),
         skills_dir: app.skills_dir.clone(),
+        extra_skills_dirs: config
+            .skills
+            .as_ref()
+            .map(|s| s.extra_dirs.clone())
+            .unwrap_or_default(),
         instructions: config.instructions_paths(),
         // Effectively unlimited. V4 has a 1M context window and the user
         // wants the model running until it's actually done. The previous cap
@@ -538,6 +543,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         memory_enabled: config.memory_enabled(),
         memory_path: config.memory_path(),
         goal_objective: app.goal.goal_objective.clone(),
+        models: config.models.clone(),
     }
 }
 
@@ -1028,6 +1034,29 @@ async fn run_event_loop(
                         if queued_to_send.is_none() {
                             queued_to_send = app.pop_queued_message();
                         }
+
+                        // Auto-review: when `auto_review = true` and the
+                        // Executor completed a turn successfully, queue a
+                        // follow-up message that instructs the model to invoke
+                        // `agent_review` on the last turn's output. Skip in
+                        // Plan mode (read-only) and if another message is
+                        // already queued (user has more to say).
+                        if queued_to_send.is_none()
+                            && app.auto_review
+                            && status
+                                == crate::core::events::TurnOutcomeStatus::Completed
+                            && app.mode != AppMode::Plan
+                        {
+                            queued_to_send = Some(QueuedMessage::new(
+                                "[auto-review] Use `agent_review` with \
+                                 artifact=\"diff\" to review the changes from \
+                                 this turn. Score every finding BLOCKER / \
+                                 MAJOR / MINOR / NIT. Use block=true so the \
+                                 critique appears inline before the next step."
+                                    .to_string(),
+                                None,
+                            ));
+                        }
                     }
                     EngineEvent::Error {
                         envelope,
@@ -1448,6 +1477,8 @@ async fn run_event_loop(
         // Expire the "Press Ctrl+C again to quit" prompt silently after its
         // window. Triggers a redraw if the prompt was visible.
         app.tick_quit_armed();
+        // Hot-reload skills if any SKILL.md changed (#19).
+        app.tick_skill_watcher();
         let allow_workspace_context_refresh =
             !app.is_loading && !has_running_agents && !app.is_compacting;
         refresh_workspace_context_if_needed(app, now, allow_workspace_context_refresh);
@@ -2447,6 +2478,12 @@ async fn run_event_loop(
                     }
                 }
                 KeyCode::Enter => {
+                    // If the slash menu is open, apply the selected entry before
+                    // submitting so the user gets the full command (e.g. `/provider`)
+                    // rather than the partial prefix they typed (e.g. `/pro`).
+                    if slash_menu_open {
+                        apply_slash_menu_selection(app, &slash_menu_entries, false);
+                    }
                     if let Some(input) = app.submit_input() {
                         if handle_plan_choice(app, &engine_handle, &input).await? {
                             continue;
@@ -4626,13 +4663,15 @@ fn render(f: &mut Frame, app: &mut App) {
             .unwrap_or("workspace");
         let effort_label = app.reasoning_effort.short_label();
         let provider_label = match app.api_provider {
-            crate::config::ApiProvider::Deepseek => None,
-            crate::config::ApiProvider::DeepseekCN => None,
+            crate::config::ApiProvider::Deepseek => Some("DeepSeek"),
+            crate::config::ApiProvider::DeepseekCN => Some("DeepSeek-CN"),
             crate::config::ApiProvider::NvidiaNim => Some("NIM"),
-            crate::config::ApiProvider::Openrouter => Some("OR"),
+            crate::config::ApiProvider::Openrouter => Some("OpenRouter"),
             crate::config::ApiProvider::Novita => Some("Novita"),
             crate::config::ApiProvider::Fireworks => Some("Fireworks"),
             crate::config::ApiProvider::Sglang => Some("SGLang"),
+            crate::config::ApiProvider::OpenAI => Some("OpenAI"),
+            crate::config::ApiProvider::Anthropic => Some("Anthropic"),
         };
         let header_data = HeaderData::new(
             app.mode,
@@ -5101,6 +5140,10 @@ async fn handle_view_events(
                 app.finalize_streaming_assistant_as_interrupted();
                 app.status_message = Some("Request cancelled".to_string());
             }
+            ViewEvent::SkillBrowseActivated { name } => {
+                let result = crate::commands::skills::activate_skill_from_event(app, &name);
+                app.status_message = Some(result);
+            }
         }
     }
 
@@ -5255,6 +5298,8 @@ async fn apply_provider_picker_api_key(
             ApiProvider::Novita => &mut providers.novita,
             ApiProvider::Fireworks => &mut providers.fireworks,
             ApiProvider::Sglang => &mut providers.sglang,
+            ApiProvider::OpenAI => &mut providers.openai,
+            ApiProvider::Anthropic => &mut providers.anthropic,
         };
         entry.api_key = Some(api_key);
     }
@@ -5935,7 +5980,11 @@ fn render_footer_from(
     let displayed_cost = app.displayed_session_cost();
     let cost = if has(S::Cost) && displayed_cost > 0.001 {
         vec![Span::styled(
-            format!("${displayed_cost:.2}"),
+            crate::pricing::format_cost_with_currency(
+                displayed_cost,
+                Some(&app.cost_currency),
+                Some(app.cny_per_usd),
+            ),
             Style::default().fg(palette::TEXT_MUTED),
         )]
     } else {
@@ -6031,7 +6080,11 @@ fn footer_auxiliary_spans(app: &App, max_width: usize) -> Vec<Span<'static>> {
     let displayed_cost = app.displayed_session_cost();
     let cost_spans = if displayed_cost > 0.001 {
         vec![Span::styled(
-            format!("${displayed_cost:.2}"),
+            crate::pricing::format_cost_with_currency(
+                displayed_cost,
+                Some(&app.cost_currency),
+                Some(app.cny_per_usd),
+            ),
             Style::default().fg(palette::TEXT_MUTED),
         )]
     } else {

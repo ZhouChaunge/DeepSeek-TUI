@@ -24,6 +24,7 @@ mod config;
 mod config_ui;
 mod core;
 mod cost_status;
+mod llm_call_costs;
 mod cycle_manager;
 mod deepseek_theme;
 mod error_taxonomy;
@@ -244,6 +245,34 @@ enum Commands {
     /// Internal: run the responses API proxy.
     #[command(hide = true)]
     ResponsesApiProxy(responses_api_proxy::Args),
+    /// Manage local skills (import, list, …).
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
+}
+
+/// Sub-commands for `deepseek skill`.
+#[derive(Subcommand, Debug, Clone)]
+enum SkillCommand {
+    /// Bulk-import skills from a local directory of SKILL.md files.
+    ///
+    /// Each sub-directory of <SOURCE> that contains a SKILL.md with a
+    /// `name:` frontmatter field is imported as a skill.
+    Import {
+        /// Source directory containing <name>/SKILL.md sub-directories.
+        #[arg(value_name = "SOURCE")]
+        source: PathBuf,
+        /// Destination skills directory [default: ~/.deepseek/skills].
+        #[arg(long, value_name = "DIR")]
+        dest: Option<PathBuf>,
+        /// Only import skills whose names match this pattern (e.g. "paper-*").
+        #[arg(long, value_name = "PATTERN")]
+        filter: Option<String>,
+        /// Overwrite already-installed skills.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
 }
 
 #[derive(Args, Debug, Clone)]
@@ -728,6 +757,7 @@ async fn main() -> Result<()> {
                 responses_api_proxy::run_main(args)?;
                 Ok(())
             }
+            Commands::Skill { command } => run_skill_command(command),
         };
     }
 
@@ -913,6 +943,66 @@ When this skill is active:\n\
 3. Prefer small, validated changes and summarize what you verified.\n\
 "
     )
+}
+
+fn run_skill_command(command: SkillCommand) -> Result<()> {
+    match command {
+        SkillCommand::Import {
+            source,
+            dest,
+            filter,
+            force,
+        } => {
+            let skills_dir = dest.unwrap_or_else(skills::default_skills_dir);
+            match skills::install::bulk_import_local(
+                &source,
+                &skills_dir,
+                filter.as_deref(),
+                force,
+            ) {
+                Ok(result) => {
+                    println!(
+                        "Skills import summary\n\
+                         Source : {}\n\
+                         Dest   : {}",
+                        source.display(),
+                        skills_dir.display()
+                    );
+                    if !result.imported.is_empty() {
+                        println!("\nImported ({}):", result.imported.len());
+                        for name in &result.imported {
+                            println!("  + {name}");
+                        }
+                    }
+                    if !result.skipped.is_empty() {
+                        println!(
+                            "\nSkipped — already installed ({}) (use --force to overwrite):",
+                            result.skipped.len()
+                        );
+                        for name in &result.skipped {
+                            println!("  ~ {name}");
+                        }
+                    }
+                    if !result.errors.is_empty() {
+                        println!("\nErrors ({}):", result.errors.len());
+                        for (name, err) in &result.errors {
+                            eprintln!("  ! {name}: {err}");
+                        }
+                    }
+                    if result.imported.is_empty()
+                        && result.skipped.is_empty()
+                        && result.errors.is_empty()
+                    {
+                        println!("\nNo skills found in source directory.");
+                    } else {
+                        println!("\nRun `deepseek skill list` to see all installed skills.");
+                    }
+                    Ok(())
+                }
+                Err(err) => bail!("Import failed: {err:#}"),
+            }
+        }
+    }
 }
 
 fn init_skills_dir(skills_dir: &Path, force: bool) -> Result<(PathBuf, WriteStatus)> {
@@ -1310,6 +1400,14 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
                 crate::config::ApiProvider::Deepseek | crate::config::ApiProvider::DeepseekCN => {
                     ("DEEPSEEK_API_KEY", "deepseek auth set --provider deepseek")
                 }
+                crate::config::ApiProvider::OpenAI => (
+                    "OPENAI_API_KEY",
+                    "deepseek auth set --provider openai --api-key \"...\"",
+                ),
+                crate::config::ApiProvider::Anthropic => (
+                    "ANTHROPIC_API_KEY",
+                    "deepseek auth set --provider anthropic --api-key \"...\"",
+                ),
             };
             println!(
                 "  {} api_key: missing  (set {env_var} or `[providers.{}].api_key` in ~/.deepseek/config.toml; or run `{login_hint}`)",
@@ -1322,6 +1420,8 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
                     crate::config::ApiProvider::Sglang => "sglang",
                     crate::config::ApiProvider::Deepseek
                     | crate::config::ApiProvider::DeepseekCN => "deepseek",
+                    crate::config::ApiProvider::OpenAI => "openai",
+                    crate::config::ApiProvider::Anthropic => "anthropic",
                 }
             );
         }
@@ -3707,6 +3807,11 @@ async fn run_exec_agent(
         notes_path: config.notes_path(),
         mcp_config_path: config.mcp_config_path(),
         skills_dir: config.skills_dir(),
+        extra_skills_dirs: config
+            .skills
+            .as_ref()
+            .map(|s| s.extra_dirs.clone())
+            .unwrap_or_default(),
         instructions: config.instructions_paths(),
         max_steps: 100,
         max_subagents,
@@ -3725,6 +3830,7 @@ async fn run_exec_agent(
         memory_enabled: config.memory_enabled(),
         memory_path: config.memory_path(),
         goal_objective: None,
+        models: config.models.clone(),
     };
 
     let engine_handle = spawn_engine(engine_config, config);

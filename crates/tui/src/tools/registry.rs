@@ -499,6 +499,14 @@ impl ToolRegistryBuilder {
         self.with_tool(Arc::new(ReviewTool::new(client, model)))
     }
 
+    /// Include the `llm_call` tool (#14). Allows the main model to invoke
+    /// a secondary model alias declared in `[models.aliases]`.
+    #[must_use]
+    pub fn with_llm_call_tool(self, models_cfg: Option<crate::config::ModelsConfig>) -> Self {
+        use super::llm_call::LlmCallTool;
+        self.with_tool(Arc::new(LlmCallTool::new(models_cfg)))
+    }
+
     /// Include the `recall_archive` tool — searches prior cycle archives
     /// produced by the checkpoint-restart system (issue #127).
     #[must_use]
@@ -641,7 +649,7 @@ impl ToolRegistryBuilder {
     ) -> Self {
         use super::subagent::{
             AgentAssignTool, AgentCancelTool, AgentCloseTool, AgentListTool, AgentResultTool,
-            AgentResumeTool, AgentSendInputTool, AgentSpawnTool, AgentWaitTool,
+            AgentResumeTool, AgentReviewTool, AgentSendInputTool, AgentSpawnTool, AgentWaitTool,
             DelegateToAgentTool,
         };
 
@@ -683,7 +691,8 @@ impl ToolRegistryBuilder {
         )))
         .with_tool(Arc::new(AgentCloseTool::new(manager.clone())))
         .with_tool(Arc::new(AgentCancelTool::new(manager.clone())))
-        .with_tool(Arc::new(AgentListTool::new(manager)))
+        .with_tool(Arc::new(AgentListTool::new(manager.clone())))
+        .with_tool(Arc::new(AgentReviewTool::new(manager, runtime)))
     }
 
     /// Build the registry with the given context.

@@ -87,6 +87,8 @@ pub struct EngineConfig {
     pub mcp_config_path: PathBuf,
     /// Directory containing discoverable skills.
     pub skills_dir: PathBuf,
+    /// Extra skill directories from `[skills] extra_dirs` in config. (#13)
+    pub extra_skills_dirs: Vec<PathBuf>,
     /// Additional instruction files concatenated into the system
     /// prompt (#454). Loaded in declared order from the user's
     /// `instructions = [...]` config (or the per-project override).
@@ -140,6 +142,8 @@ pub struct EngineConfig {
     /// consulted when `memory_enabled` is `true`.
     pub memory_path: PathBuf,
     pub goal_objective: Option<String>,
+    /// Named secondary-model aliases for `llm_call` (#14).
+    pub models: Option<crate::config::ModelsConfig>,
 }
 
 impl Default for EngineConfig {
@@ -152,6 +156,7 @@ impl Default for EngineConfig {
             notes_path: PathBuf::from("notes.txt"),
             mcp_config_path: PathBuf::from("mcp.json"),
             skills_dir: crate::skills::default_skills_dir(),
+            extra_skills_dirs: Vec::new(),
             instructions: Vec::new(),
             max_steps: 100,
             max_subagents: DEFAULT_MAX_SUBAGENTS,
@@ -170,6 +175,7 @@ impl Default for EngineConfig {
             memory_enabled: false,
             memory_path: PathBuf::from("./memory.md"),
             goal_objective: None,
+            models: None,
         }
     }
 }
@@ -1270,7 +1276,8 @@ impl Engine {
         .with_runtime_services(self.config.runtime_services.clone())
         .with_cancel_token(self.cancel_token.clone())
         .with_event_tx(self.tx_event.clone())
-        .with_trusted_external_paths(trusted.paths().to_vec());
+        .with_trusted_external_paths(trusted.paths().to_vec())
+        .with_extra_skills_dirs(self.config.extra_skills_dirs.clone());
 
         // Hand the user-memory path to tools so the model-callable
         // `remember` tool can append entries (#489). `None` when the

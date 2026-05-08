@@ -13,6 +13,7 @@ pub mod fetch_url;
 pub mod git;
 pub mod git_history;
 pub mod github;
+pub mod llm_call;
 pub mod parallel;
 pub mod plan;
 pub mod project;
