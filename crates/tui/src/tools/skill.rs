@@ -27,7 +27,7 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::skills::{Skill, discover_in_workspace, skills_directories};
+use crate::skills::{Skill, ToolCompat, discover_in_workspace_with_extra, translate_tool_names, runtime_adapter_block};
 
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
@@ -90,11 +90,17 @@ impl ToolSpec for LoadSkillTool {
         // tool's lookup mirrors what the system-prompt skills block
         // already lists, so the model never asks for a name it
         // can't find.
-        let registry = discover_in_workspace(&context.workspace);
+        let registry = crate::skills::discover_in_workspace_with_extra(
+            &context.workspace,
+            &context.extra_skills_dirs,
+        );
         let Some(skill) = registry.get(name) else {
             let available: Vec<&str> = registry.list().iter().map(|s| s.name.as_str()).collect();
             let hint = if available.is_empty() {
-                let dirs: Vec<String> = skills_directories(&context.workspace)
+                let dirs: Vec<String> = crate::skills::skills_directories_with_extra(
+                        &context.workspace,
+                        &context.extra_skills_dirs,
+                    )
                     .iter()
                     .map(|p| p.display().to_string())
                     .collect();
@@ -113,7 +119,12 @@ impl ToolSpec for LoadSkillTool {
             return Err(ToolError::execution_failed(hint));
         };
 
-        let body = format_skill_body(skill);
+        let body = if skill.tool_compat == ToolCompat::ClaudeCode {
+            let translated = translate_tool_names(&format_skill_body(skill));
+            translated + &runtime_adapter_block(skill)
+        } else {
+            format_skill_body(skill)
+        };
         Ok(ToolResult::success(body).with_metadata(json!({
             "skill_name": skill.name,
             "skill_path": skill.path.display().to_string(),
