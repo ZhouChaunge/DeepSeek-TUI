@@ -30,6 +30,23 @@ pub const DEFAULT_FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference
 pub const DEFAULT_SGLANG_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub const DEFAULT_SGLANG_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub const DEFAULT_SGLANG_BASE_URL: &str = "http://localhost:30000/v1";
+pub const DEFAULT_OPENAI_MODEL: &str = "gpt-4o";
+pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
+pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
+
+// --- Well-known OpenAI model IDs ---
+pub const OPENAI_GPT_4O: &str = "gpt-4o";
+pub const OPENAI_GPT_4O_MINI: &str = "gpt-4o-mini";
+pub const OPENAI_GPT_4_5: &str = "gpt-4.5";
+pub const OPENAI_GPT_5_4: &str = "gpt-5.4";
+pub const OPENAI_GPT_5_5: &str = "gpt-5.5";
+
+// --- Well-known Anthropic model IDs ---
+pub const ANTHROPIC_CLAUDE_SONNET_4_6: &str = "claude-sonnet-4-6";
+pub const ANTHROPIC_CLAUDE_SONNET_4_5: &str = "claude-sonnet-4-5";
+pub const ANTHROPIC_CLAUDE_OPUS_4_5: &str = "claude-opus-4-5";
+pub const ANTHROPIC_CLAUDE_HAIKU_4_5: &str = "claude-haiku-4-5";
 pub const DEFAULT_DEEPSEEKCN_BASE_URL: &str = "https://api.deepseeki.com";
 const API_KEYRING_SENTINEL: &str = "__KEYRING__";
 pub const COMMON_DEEPSEEK_MODELS: &[&str] = &[
@@ -39,6 +56,22 @@ pub const COMMON_DEEPSEEK_MODELS: &[&str] = &[
     "deepseek-ai/deepseek-v4-flash",
     "deepseek/deepseek-v4-pro",
     "deepseek/deepseek-v4-flash",
+];
+pub const COMMON_OPENAI_MODELS: &[&str] = &[
+    OPENAI_GPT_4O,
+    OPENAI_GPT_4O_MINI,
+    OPENAI_GPT_4_5,
+    OPENAI_GPT_5_4,
+    OPENAI_GPT_5_5,
+    "o1",
+    "o3",
+    "o4-mini",
+];
+pub const COMMON_ANTHROPIC_MODELS: &[&str] = &[
+    ANTHROPIC_CLAUDE_SONNET_4_6,
+    ANTHROPIC_CLAUDE_SONNET_4_5,
+    ANTHROPIC_CLAUDE_OPUS_4_5,
+    ANTHROPIC_CLAUDE_HAIKU_4_5,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -51,6 +84,8 @@ pub enum ApiProvider {
     Novita,
     Fireworks,
     Sglang,
+    OpenAI,
+    Anthropic,
 }
 
 impl ApiProvider {
@@ -66,6 +101,8 @@ impl ApiProvider {
             "novita" => Some(Self::Novita),
             "fireworks" | "fireworks-ai" => Some(Self::Fireworks),
             "sglang" | "sg-lang" => Some(Self::Sglang),
+            "openai" | "open-ai" | "open_ai" => Some(Self::OpenAI),
+            "anthropic" | "claude" => Some(Self::Anthropic),
             _ => None,
         }
     }
@@ -80,6 +117,8 @@ impl ApiProvider {
             Self::Novita => "novita",
             Self::Fireworks => "fireworks",
             Self::Sglang => "sglang",
+            Self::OpenAI => "openai",
+            Self::Anthropic => "anthropic",
         }
     }
 
@@ -94,6 +133,8 @@ impl ApiProvider {
             Self::Novita => "Novita AI",
             Self::Fireworks => "Fireworks AI",
             Self::Sglang => "SGLang",
+            Self::OpenAI => "OpenAI",
+            Self::Anthropic => "Anthropic",
         }
     }
 
@@ -108,6 +149,8 @@ impl ApiProvider {
             Self::Novita,
             Self::Fireworks,
             Self::Sglang,
+            Self::OpenAI,
+            Self::Anthropic,
         ]
     }
 }
@@ -296,10 +339,8 @@ pub fn normalize_model_name(model: &str) -> Option<String> {
     }
 
     let normalized = trimmed.to_ascii_lowercase();
-    if !normalized.starts_with("deepseek") {
-        return None;
-    }
-
+    // Accept any provider's model IDs, not just deepseek-prefixed ones.
+    // Only the character-validity check applies.
     if normalized.chars().all(|ch| {
         ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_' | '.' | ':' | '/')
     }) {
@@ -343,6 +384,24 @@ pub struct TuiConfig {
     /// label and ignore the escape. Defaults to `true`; set `false` for
     /// terminals that misrender the sequence.
     pub osc8_links: Option<bool>,
+    /// Currency used for displaying session costs. `"usd"` (default) keeps the
+    /// existing dollar display; `"cny"` converts to Chinese Yuan (RMB) using
+    /// the `cny_per_usd` exchange rate.
+    pub cost_currency: Option<CostCurrency>,
+    /// USD → CNY exchange rate used when `cost_currency = "cny"`. Defaults to
+    /// `7.3` when omitted. Update as the market rate changes.
+    pub cny_per_usd: Option<f64>,
+}
+
+/// Display currency for session cost figures.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CostCurrency {
+    /// United States Dollar (default). Costs shown as `$X.XX`.
+    #[default]
+    Usd,
+    /// Chinese Yuan / RMB. Costs shown as `¥X.XX` after conversion.
+    Cny,
 }
 
 /// Notification delivery method (mirrors `tui::notifications::Method`).
@@ -419,6 +478,31 @@ pub struct MemoryConfig {
     /// `# foo` typed in the composer to append to that file. Default `false`.
     #[serde(default)]
     pub enabled: Option<bool>,
+}
+
+/// `[review]` table — dual-agent adversarial review settings.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ReviewConfig {
+    /// Model used for reviewer sub-agents. Inherits from the session model
+    /// when absent. Setting a different (stronger/independent) model makes
+    /// the reviewer genuinely adversarial.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Reasoning effort for the reviewer: "low" | "medium" | "high" | "max".
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// When `true`, spawn a Reviewer sub-agent automatically after each
+    /// Executor agent turn and inject the critique into the next turn's
+    /// context. Default `false`.
+    #[serde(default)]
+    pub auto_review: Option<bool>,
+}
+
+impl ReviewConfig {
+    #[must_use]
+    pub fn is_auto_review(&self) -> bool {
+        self.auto_review.unwrap_or(false)
+    }
 }
 
 impl SnapshotsConfig {
@@ -764,6 +848,10 @@ pub struct Config {
     #[serde(default)]
     pub lsp: Option<LspConfigToml>,
 
+    /// Dual-agent adversarial review settings. When absent, defaults apply.
+    #[serde(default)]
+    pub review: Option<ReviewConfig>,
+
     /// Append-only layered context management with Flash seam manager (#159).
     #[serde(default)]
     pub context: ContextConfig,
@@ -778,6 +866,63 @@ pub struct Config {
     /// / tauri://localhost as the only allowed dev origins.
     #[serde(default)]
     pub runtime_api: Option<RuntimeApiConfig>,
+
+    /// Named secondary-model aliases for `llm_call` (#14).
+    /// Declared in config.toml under `[models.aliases.<name>]`.
+    #[serde(default)]
+    pub models: Option<ModelsConfig>,
+}
+
+/// A single secondary-model alias entry, declared in config.toml under
+/// `[models.aliases.<name>]`.
+///
+/// Example:
+/// ```toml
+/// [models.aliases.reviewer]
+/// provider = "openai"
+/// model = "gpt-4o"
+/// api_key_env = "OPENAI_API_KEY"
+/// max_calls_per_session = 20
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ModelAlias {
+    /// Provider string: `"openai"`, `"anthropic"`, `"deepseek"`, `"openrouter"`, …
+    pub provider: String,
+    /// Model ID to pass in the API request.
+    pub model: String,
+    /// Env var that holds the API key. Takes precedence over `api_key`.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Inline API key fallback (only used when `api_key_env` is unset or empty).
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Maximum `llm_call` invocations per session. `None` = unlimited.
+    #[serde(default)]
+    pub max_calls_per_session: Option<u32>,
+}
+
+impl ModelAlias {
+    /// Resolve the effective API key: env var first, then inline field.
+    #[must_use]
+    pub fn resolve_api_key(&self) -> Option<String> {
+        if let Some(var) = &self.api_key_env {
+            if let Ok(val) = std::env::var(var) {
+                if !val.is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+        self.api_key.clone()
+    }
+}
+
+/// `[models]` table in config.toml. Holds named secondary model aliases for
+/// the `llm_call` tool (#14).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ModelsConfig {
+    /// Named aliases keyed by alias name.
+    #[serde(default)]
+    pub aliases: std::collections::BTreeMap<String, ModelAlias>,
 }
 
 /// `[runtime_api]` table — knobs for the local HTTP/SSE daemon.
@@ -805,6 +950,9 @@ pub struct SkillsConfig {
     /// this limit are rejected during validation. Defaults to 5 MiB.
     #[serde(default)]
     pub max_install_size_bytes: Option<u64>,
+    /// Extra directories to search for skills in addition to the default.
+    #[serde(default)]
+    pub extra_dirs: Vec<std::path::PathBuf>,
 }
 
 impl SkillsConfig {
@@ -946,6 +1094,10 @@ pub struct ProvidersConfig {
     pub fireworks: ProviderConfig,
     #[serde(default)]
     pub sglang: ProviderConfig,
+    #[serde(default)]
+    pub openai: ProviderConfig,
+    #[serde(default)]
+    pub anthropic: ProviderConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1005,7 +1157,7 @@ impl Config {
             && ApiProvider::parse(provider).is_none()
         {
             anyhow::bail!(
-                "Invalid provider '{provider}': expected deepseek, deepseek-cn, nvidia-nim, openrouter, novita, fireworks, or sglang."
+                "Invalid provider '{provider}': expected deepseek, deepseek-cn, nvidia-nim, openrouter, novita, fireworks, sglang, openai, or anthropic."
             );
         }
         if let Some(ref key) = self.api_key
@@ -1024,7 +1176,8 @@ impl Config {
             && normalize_model_name(model).is_none()
         {
             anyhow::bail!(
-                "Invalid default_text_model '{model}': expected a DeepSeek model ID (for example: deepseek-v4-pro, deepseek-v4-flash, deepseek-ai/deepseek-v4-pro)."
+                "Invalid default_text_model '{model}': expected a valid model ID \
+                 (e.g., deepseek-v4-pro, gpt-4o, claude-opus-4-5)."
             );
         }
         if let Some(policy) = self.approval_policy.as_deref() {
@@ -1122,6 +1275,8 @@ impl Config {
             ApiProvider::Novita => &providers.novita,
             ApiProvider::Fireworks => &providers.fireworks,
             ApiProvider::Sglang => &providers.sglang,
+            ApiProvider::OpenAI => &providers.openai,
+            ApiProvider::Anthropic => &providers.anthropic,
         })
     }
 
@@ -1152,6 +1307,8 @@ impl Config {
             ApiProvider::Novita => DEFAULT_NOVITA_MODEL,
             ApiProvider::Fireworks => DEFAULT_FIREWORKS_MODEL,
             ApiProvider::Sglang => DEFAULT_SGLANG_MODEL,
+            ApiProvider::OpenAI => DEFAULT_OPENAI_MODEL,
+            ApiProvider::Anthropic => DEFAULT_ANTHROPIC_MODEL,
         }
         .to_string()
     }
@@ -1177,7 +1334,9 @@ impl Config {
             ApiProvider::Openrouter
             | ApiProvider::Novita
             | ApiProvider::Fireworks
-            | ApiProvider::Sglang => None,
+            | ApiProvider::Sglang
+            | ApiProvider::OpenAI
+            | ApiProvider::Anthropic => None,
         };
         let base = provider_base.or(root_base).unwrap_or_else(|| {
             match provider {
@@ -1188,6 +1347,8 @@ impl Config {
                 ApiProvider::Novita => DEFAULT_NOVITA_BASE_URL,
                 ApiProvider::Fireworks => DEFAULT_FIREWORKS_BASE_URL,
                 ApiProvider::Sglang => DEFAULT_SGLANG_BASE_URL,
+                ApiProvider::OpenAI => DEFAULT_OPENAI_BASE_URL,
+                ApiProvider::Anthropic => DEFAULT_ANTHROPIC_BASE_URL,
             }
             .to_string()
         });
@@ -1211,6 +1372,8 @@ impl Config {
             ApiProvider::Novita => "novita",
             ApiProvider::Fireworks => "fireworks",
             ApiProvider::Sglang => "sglang",
+            ApiProvider::OpenAI => "openai",
+            ApiProvider::Anthropic => "anthropic",
         };
 
         // 0. Explicit in-memory override (set by onboarding / provider
@@ -1275,6 +1438,14 @@ impl Config {
             // localhost. Return an empty key and let the client omit the
             // Authorization header.
             ApiProvider::Sglang => Ok(String::new()),
+            ApiProvider::OpenAI => anyhow::bail!(
+                "OpenAI API key not found. Run 'deepseek auth set --provider openai', \
+                 set OPENAI_API_KEY, or add [providers.openai] api_key in ~/.deepseek/config.toml."
+            ),
+            ApiProvider::Anthropic => anyhow::bail!(
+                "Anthropic API key not found. Run 'deepseek auth set --provider anthropic', \
+                 set ANTHROPIC_API_KEY, or add [providers.anthropic] api_key in ~/.deepseek/config.toml."
+            ),
         }
     }
 
@@ -1684,6 +1855,26 @@ fn apply_env_overrides(config: &mut Config) {
     {
         config.default_text_model = Some(value);
     }
+    if matches!(config.api_provider(), ApiProvider::OpenAI)
+        && let Ok(value) = std::env::var("OPENAI_BASE_URL")
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .openai
+            .base_url = Some(value);
+    }
+    if matches!(config.api_provider(), ApiProvider::Anthropic)
+        && let Ok(value) = std::env::var("ANTHROPIC_BASE_URL")
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .anthropic
+            .base_url = Some(value);
+    }
     if let Ok(value) =
         std::env::var("DEEPSEEK_MODEL").or_else(|_| std::env::var("DEEPSEEK_DEFAULT_TEXT_MODEL"))
     {
@@ -1894,6 +2085,16 @@ fn normalize_model_config(config: &mut Config) {
         {
             providers.sglang.model = Some(normalized);
         }
+        if let Some(model) = providers.openai.model.as_deref()
+            && let Some(normalized) = normalize_model_for_provider(ApiProvider::OpenAI, model)
+        {
+            providers.openai.model = Some(normalized);
+        }
+        if let Some(model) = providers.anthropic.model.as_deref()
+            && let Some(normalized) = normalize_model_for_provider(ApiProvider::Anthropic, model)
+        {
+            providers.anthropic.model = Some(normalized);
+        }
     }
 }
 
@@ -1999,6 +2200,8 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         snapshots: override_cfg.snapshots.or(base.snapshots),
         memory: override_cfg.memory.or(base.memory),
         lsp: override_cfg.lsp.or(base.lsp),
+        review: override_cfg.review.or(base.review),
+        models: override_cfg.models.or(base.models),
         context: ContextConfig {
             enabled: override_cfg.context.enabled.or(base.context.enabled),
             verbatim_window_turns: override_cfg
@@ -2053,6 +2256,8 @@ fn merge_providers(
             novita: merge_provider_config(base.novita, override_cfg.novita),
             fireworks: merge_provider_config(base.fireworks, override_cfg.fireworks),
             sglang: merge_provider_config(base.sglang, override_cfg.sglang),
+            openai: merge_provider_config(base.openai, override_cfg.openai),
+            anthropic: merge_provider_config(base.anthropic, override_cfg.anthropic),
         }),
     }
 }
@@ -2307,6 +2512,8 @@ pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
         ApiProvider::Novita => "NOVITA_API_KEY",
         ApiProvider::Fireworks => "FIREWORKS_API_KEY",
         ApiProvider::Sglang => "SGLANG_API_KEY",
+        ApiProvider::OpenAI => "OPENAI_API_KEY",
+        ApiProvider::Anthropic => "ANTHROPIC_API_KEY",
     };
     if std::env::var(env_var).is_ok_and(|k| !k.trim().is_empty()) {
         return true;
@@ -2364,6 +2571,8 @@ pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf>
         ApiProvider::Novita => "providers.novita",
         ApiProvider::Fireworks => "providers.fireworks",
         ApiProvider::Sglang => "providers.sglang",
+        ApiProvider::OpenAI => "providers.openai",
+        ApiProvider::Anthropic => "providers.anthropic",
     };
 
     // Parse existing TOML (or start fresh) so we can edit the right table
@@ -2391,6 +2600,8 @@ pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf>
         ApiProvider::Novita => "novita",
         ApiProvider::Fireworks => "fireworks",
         ApiProvider::Sglang => "sglang",
+        ApiProvider::OpenAI => "openai",
+        ApiProvider::Anthropic => "anthropic",
     };
     let entry = providers
         .entry(key_inside.to_string())
@@ -3146,10 +3357,28 @@ api_key = "old-openrouter-key"
     }
 
     #[test]
-    fn normalize_model_name_rejects_invalid_or_non_deepseek_ids() {
-        assert!(normalize_model_name("gpt-4o").is_none());
+    fn normalize_model_name_rejects_invalid_ids() {
+        // Spaces and special chars are rejected regardless of vendor.
         assert!(normalize_model_name("deepseek v4").is_none());
         assert!(normalize_model_name("").is_none());
+        assert!(normalize_model_name("model name!").is_none());
+    }
+
+    #[test]
+    fn normalize_model_name_accepts_openai_anthropic_ids() {
+        // Since multi-vendor support was added, any valid-char model ID is accepted.
+        assert_eq!(normalize_model_name("gpt-4o").as_deref(), Some("gpt-4o"));
+        assert_eq!(normalize_model_name("gpt-4.5").as_deref(), Some("gpt-4.5"));
+        assert_eq!(normalize_model_name("gpt-5.4").as_deref(), Some("gpt-5.4"));
+        assert_eq!(normalize_model_name("gpt-5.5").as_deref(), Some("gpt-5.5"));
+        assert_eq!(
+            normalize_model_name("claude-sonnet-4-6").as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(
+            normalize_model_name("claude-opus-4-5").as_deref(),
+            Some("claude-opus-4-5")
+        );
     }
 
     #[test]

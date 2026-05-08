@@ -26,14 +26,19 @@ const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_NOVITA_BASE_URL: &str = "https://api.novita.ai/v1";
 const DEFAULT_FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
 const DEFAULT_SGLANG_BASE_URL: &str = "http://localhost:30000/v1";
+const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
+const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
+const DEFAULT_DEEPSEEKCN_BASE_URL: &str = "https://api.deepseeki.com";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
     #[default]
     Deepseek,
+    DeepseekCN,
     NvidiaNim,
     Openai,
+    Anthropic,
     Openrouter,
     Novita,
     Fireworks,
@@ -45,8 +50,10 @@ impl ProviderKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Deepseek => "deepseek",
+            Self::DeepseekCN => "deepseek-cn",
             Self::NvidiaNim => "nvidia-nim",
             Self::Openai => "openai",
+            Self::Anthropic => "anthropic",
             Self::Openrouter => "openrouter",
             Self::Novita => "novita",
             Self::Fireworks => "fireworks",
@@ -58,8 +65,10 @@ impl ProviderKind {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "deepseek" | "deep-seek" => Some(Self::Deepseek),
+            "deepseek-cn" | "deepseek_cn" | "deepseekcn" => Some(Self::DeepseekCN),
             "nvidia" | "nvidia-nim" | "nvidia_nim" | "nim" => Some(Self::NvidiaNim),
             "openai" | "open-ai" => Some(Self::Openai),
+            "anthropic" => Some(Self::Anthropic),
             "openrouter" | "open_router" => Some(Self::Openrouter),
             "novita" => Some(Self::Novita),
             "fireworks" | "fireworks-ai" => Some(Self::Fireworks),
@@ -81,9 +90,13 @@ pub struct ProvidersToml {
     #[serde(default)]
     pub deepseek: ProviderConfigToml,
     #[serde(default)]
+    pub deepseek_cn: ProviderConfigToml,
+    #[serde(default)]
     pub nvidia_nim: ProviderConfigToml,
     #[serde(default)]
     pub openai: ProviderConfigToml,
+    #[serde(default)]
+    pub anthropic: ProviderConfigToml,
     #[serde(default)]
     pub openrouter: ProviderConfigToml,
     #[serde(default)]
@@ -99,8 +112,10 @@ impl ProvidersToml {
     pub fn for_provider(&self, provider: ProviderKind) -> &ProviderConfigToml {
         match provider {
             ProviderKind::Deepseek => &self.deepseek,
+            ProviderKind::DeepseekCN => &self.deepseek_cn,
             ProviderKind::NvidiaNim => &self.nvidia_nim,
             ProviderKind::Openai => &self.openai,
+            ProviderKind::Anthropic => &self.anthropic,
             ProviderKind::Openrouter => &self.openrouter,
             ProviderKind::Novita => &self.novita,
             ProviderKind::Fireworks => &self.fireworks,
@@ -111,8 +126,10 @@ impl ProvidersToml {
     pub fn for_provider_mut(&mut self, provider: ProviderKind) -> &mut ProviderConfigToml {
         match provider {
             ProviderKind::Deepseek => &mut self.deepseek,
+            ProviderKind::DeepseekCN => &mut self.deepseek_cn,
             ProviderKind::NvidiaNim => &mut self.nvidia_nim,
             ProviderKind::Openai => &mut self.openai,
+            ProviderKind::Anthropic => &mut self.anthropic,
             ProviderKind::Openrouter => &mut self.openrouter,
             ProviderKind::Novita => &mut self.novita,
             ProviderKind::Fireworks => &mut self.fireworks,
@@ -160,8 +177,119 @@ pub struct ConfigToml {
     /// applies the defaults documented in [`LspConfigToml`].
     #[serde(default)]
     pub lsp: Option<LspConfigToml>,
+    /// Dual-agent adversarial review settings. When absent, defaults apply
+    /// (model inherits from `model`; `auto_review` is false).
+    #[serde(default)]
+    pub review: Option<ReviewConfigToml>,
+    /// Named model aliases for `llm_call` secondary-model routing (#15).
+    /// When absent, no secondary models are configured.
+    #[serde(default)]
+    pub models: Option<ModelsToml>,
     #[serde(flatten)]
     pub extras: BTreeMap<String, toml::Value>,
+}
+
+/// On-disk schema for the `[review]` table. Configures the dual-agent
+/// adversarial review mode (Executor + Reviewer cross-model critique).
+///
+/// Example `~/.deepseek/config.toml`:
+/// ```toml
+/// [review]
+/// model = "deepseek-v4-pro"
+/// effort = "max"
+/// auto_review = false
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReviewConfigToml {
+    /// Model used for reviewer sub-agents. When absent, inherits the session
+    /// model. Typically set to a stronger / different model so the reviewer
+    /// is genuinely adversarial.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Reasoning effort for the reviewer. One of "low", "medium", "high",
+    /// "max". Defaults to "high" when absent.
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// When `true`, automatically spawn a reviewer sub-agent after every
+    /// Executor agent turn and inject the critique into the next turn's
+    /// context. Defaults to `false`.
+    #[serde(default)]
+    pub auto_review: Option<bool>,
+}
+
+impl ReviewConfigToml {
+    /// Resolve `auto_review`, defaulting to `false`.
+    #[must_use]
+    pub fn is_auto_review(&self) -> bool {
+        self.auto_review.unwrap_or(false)
+    }
+}
+
+/// On-disk schema for a single model alias entry in `[models.aliases.<name>]`.
+///
+/// Example:
+/// ```toml
+/// [models.aliases.reviewer]
+/// provider = "openai"
+/// model = "gpt-5.4"
+/// api_key_env = "OPENAI_API_KEY"
+/// max_calls_per_session = 20
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelAliasToml {
+    /// Provider kind string, e.g. `"openai"`, `"anthropic"`, `"deepseek"`.
+    pub provider: String,
+    /// Model ID to use for this alias, e.g. `"gpt-5.4"`.
+    pub model: String,
+    /// Name of the environment variable holding the API key.
+    /// When set, takes precedence over `api_key`.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Inline API key (fallback when `api_key_env` is absent or unset).
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Maximum number of `llm_call` invocations allowed per session.
+    /// `None` means unlimited.
+    #[serde(default)]
+    pub max_calls_per_session: Option<u32>,
+}
+
+impl ModelAliasToml {
+    /// Resolve the API key: env var first, then inline field.
+    #[must_use]
+    pub fn resolve_api_key(&self) -> Option<String> {
+        if let Some(env_var) = &self.api_key_env {
+            if let Ok(val) = std::env::var(env_var) {
+                if !val.is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+        self.api_key.clone()
+    }
+}
+
+/// On-disk schema for the `[models]` table.
+///
+/// Example:
+/// ```toml
+/// [models]
+/// primary = "deepseek-v4-pro"
+///
+/// [models.aliases.reviewer]
+/// provider = "openai"
+/// model = "gpt-5.4"
+/// api_key_env = "OPENAI_API_KEY"
+/// max_calls_per_session = 20
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelsToml {
+    /// Override the global primary model.
+    #[serde(default)]
+    pub primary: Option<String>,
+    /// Named secondary model aliases resolvable by `llm_call`.
+    #[serde(default)]
+    pub aliases: std::collections::BTreeMap<String, ModelAliasToml>,
 }
 
 /// On-disk schema for the `[skills]` table (#140). See `config.example.toml`
@@ -176,6 +304,13 @@ pub struct SkillsToml {
     /// uses 5 MiB.
     #[serde(default)]
     pub max_install_size_bytes: Option<u64>,
+    /// Extra directories to scan for skills in addition to the built-in
+    /// precedence chain (`<workspace>/.agents/skills` → `<workspace>/skills`
+    /// → `~/.deepseek/skills`). Supports `~` expansion. Skills found here
+    /// are appended *after* the built-in directories, so the built-in ones
+    /// always win on name conflicts. (#13)
+    #[serde(default)]
+    pub extra_dirs: Vec<std::path::PathBuf>,
 }
 
 /// On-disk schema for the `[snapshots]` table (#137). See
@@ -355,12 +490,18 @@ impl ConfigToml {
             "providers.deepseek.api_key" => self.providers.deepseek.api_key.clone(),
             "providers.deepseek.base_url" => self.providers.deepseek.base_url.clone(),
             "providers.deepseek.model" => self.providers.deepseek.model.clone(),
+            "providers.deepseek_cn.api_key" => self.providers.deepseek_cn.api_key.clone(),
+            "providers.deepseek_cn.base_url" => self.providers.deepseek_cn.base_url.clone(),
+            "providers.deepseek_cn.model" => self.providers.deepseek_cn.model.clone(),
             "providers.nvidia_nim.api_key" => self.providers.nvidia_nim.api_key.clone(),
             "providers.nvidia_nim.base_url" => self.providers.nvidia_nim.base_url.clone(),
             "providers.nvidia_nim.model" => self.providers.nvidia_nim.model.clone(),
             "providers.openai.api_key" => self.providers.openai.api_key.clone(),
             "providers.openai.base_url" => self.providers.openai.base_url.clone(),
             "providers.openai.model" => self.providers.openai.model.clone(),
+            "providers.anthropic.api_key" => self.providers.anthropic.api_key.clone(),
+            "providers.anthropic.base_url" => self.providers.anthropic.base_url.clone(),
+            "providers.anthropic.model" => self.providers.anthropic.model.clone(),
             "providers.openrouter.api_key" => self.providers.openrouter.api_key.clone(),
             "providers.openrouter.base_url" => self.providers.openrouter.base_url.clone(),
             "providers.openrouter.model" => self.providers.openrouter.model.clone(),
@@ -415,6 +556,24 @@ impl ConfigToml {
             "providers.openai.api_key" => self.providers.openai.api_key = Some(value.to_string()),
             "providers.openai.base_url" => self.providers.openai.base_url = Some(value.to_string()),
             "providers.openai.model" => self.providers.openai.model = Some(value.to_string()),
+            "providers.anthropic.api_key" => {
+                self.providers.anthropic.api_key = Some(value.to_string());
+            }
+            "providers.anthropic.base_url" => {
+                self.providers.anthropic.base_url = Some(value.to_string());
+            }
+            "providers.anthropic.model" => {
+                self.providers.anthropic.model = Some(value.to_string());
+            }
+            "providers.deepseek_cn.api_key" => {
+                self.providers.deepseek_cn.api_key = Some(value.to_string());
+            }
+            "providers.deepseek_cn.base_url" => {
+                self.providers.deepseek_cn.base_url = Some(value.to_string());
+            }
+            "providers.deepseek_cn.model" => {
+                self.providers.deepseek_cn.model = Some(value.to_string());
+            }
             "providers.nvidia_nim.api_key" => {
                 self.providers.nvidia_nim.api_key = Some(value.to_string());
             }
@@ -498,6 +657,12 @@ impl ConfigToml {
             "providers.openai.api_key" => self.providers.openai.api_key = None,
             "providers.openai.base_url" => self.providers.openai.base_url = None,
             "providers.openai.model" => self.providers.openai.model = None,
+            "providers.anthropic.api_key" => self.providers.anthropic.api_key = None,
+            "providers.anthropic.base_url" => self.providers.anthropic.base_url = None,
+            "providers.anthropic.model" => self.providers.anthropic.model = None,
+            "providers.deepseek_cn.api_key" => self.providers.deepseek_cn.api_key = None,
+            "providers.deepseek_cn.base_url" => self.providers.deepseek_cn.base_url = None,
+            "providers.deepseek_cn.model" => self.providers.deepseek_cn.model = None,
             "providers.nvidia_nim.api_key" => self.providers.nvidia_nim.api_key = None,
             "providers.nvidia_nim.base_url" => self.providers.nvidia_nim.base_url = None,
             "providers.nvidia_nim.model" => self.providers.nvidia_nim.model = None,
@@ -570,6 +735,15 @@ impl ConfigToml {
         if let Some(v) = self.providers.deepseek.model.as_ref() {
             out.insert("providers.deepseek.model".to_string(), v.clone());
         }
+        if let Some(v) = self.providers.deepseek_cn.api_key.as_ref() {
+            out.insert("providers.deepseek_cn.api_key".to_string(), redact_secret(v));
+        }
+        if let Some(v) = self.providers.deepseek_cn.base_url.as_ref() {
+            out.insert("providers.deepseek_cn.base_url".to_string(), v.clone());
+        }
+        if let Some(v) = self.providers.deepseek_cn.model.as_ref() {
+            out.insert("providers.deepseek_cn.model".to_string(), v.clone());
+        }
         if let Some(v) = self.providers.openai.api_key.as_ref() {
             out.insert("providers.openai.api_key".to_string(), redact_secret(v));
         }
@@ -578,6 +752,15 @@ impl ConfigToml {
         }
         if let Some(v) = self.providers.openai.model.as_ref() {
             out.insert("providers.openai.model".to_string(), v.clone());
+        }
+        if let Some(v) = self.providers.anthropic.api_key.as_ref() {
+            out.insert("providers.anthropic.api_key".to_string(), redact_secret(v));
+        }
+        if let Some(v) = self.providers.anthropic.base_url.as_ref() {
+            out.insert("providers.anthropic.base_url".to_string(), v.clone());
+        }
+        if let Some(v) = self.providers.anthropic.model.as_ref() {
+            out.insert("providers.anthropic.model".to_string(), v.clone());
         }
         if let Some(v) = self.providers.nvidia_nim.api_key.as_ref() {
             out.insert("providers.nvidia_nim.api_key".to_string(), redact_secret(v));
@@ -689,8 +872,10 @@ impl ConfigToml {
             .or(root_deepseek_base_url)
             .unwrap_or_else(|| match provider {
                 ProviderKind::Deepseek => DEFAULT_DEEPSEEK_BASE_URL.to_string(),
+                ProviderKind::DeepseekCN => DEFAULT_DEEPSEEKCN_BASE_URL.to_string(),
                 ProviderKind::NvidiaNim => DEFAULT_NVIDIA_NIM_BASE_URL.to_string(),
                 ProviderKind::Openai => DEFAULT_OPENAI_BASE_URL.to_string(),
+                ProviderKind::Anthropic => DEFAULT_ANTHROPIC_BASE_URL.to_string(),
                 ProviderKind::Openrouter => DEFAULT_OPENROUTER_BASE_URL.to_string(),
                 ProviderKind::Novita => DEFAULT_NOVITA_BASE_URL.to_string(),
                 ProviderKind::Fireworks => DEFAULT_FIREWORKS_BASE_URL.to_string(),
@@ -706,8 +891,10 @@ impl ConfigToml {
             .or_else(|| self.model.clone())
             .unwrap_or_else(|| match provider {
                 ProviderKind::Deepseek => DEFAULT_DEEPSEEK_MODEL.to_string(),
+                ProviderKind::DeepseekCN => DEFAULT_DEEPSEEK_MODEL.to_string(),
                 ProviderKind::NvidiaNim => DEFAULT_NVIDIA_NIM_MODEL.to_string(),
                 ProviderKind::Openai => DEFAULT_OPENAI_MODEL.to_string(),
+                ProviderKind::Anthropic => DEFAULT_ANTHROPIC_MODEL.to_string(),
                 ProviderKind::Openrouter => DEFAULT_OPENROUTER_MODEL.to_string(),
                 ProviderKind::Novita => DEFAULT_NOVITA_MODEL.to_string(),
                 ProviderKind::Fireworks => DEFAULT_FIREWORKS_MODEL.to_string(),
@@ -1021,8 +1208,10 @@ impl EnvRuntimeOverrides {
         // values (`providers.<name>.base_url`) still win when env is unset.
         match provider {
             ProviderKind::Deepseek => self.deepseek_base_url.clone(),
+            ProviderKind::DeepseekCN => None,
             ProviderKind::NvidiaNim => self.nvidia_base_url.clone(),
             ProviderKind::Openai => self.openai_base_url.clone(),
+            ProviderKind::Anthropic => None,
             ProviderKind::Openrouter => self.openrouter_base_url.clone(),
             ProviderKind::Novita => self.novita_base_url.clone(),
             ProviderKind::Fireworks => self.fireworks_base_url.clone(),
